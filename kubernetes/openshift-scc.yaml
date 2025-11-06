@@ -1,0 +1,67 @@
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: my-gpu-exporter-scc
+allowHostDirVolumePlugin: true
+allowHostIPC: false
+allowHostNetwork: true
+allowHostPID: true
+allowHostPorts: true
+allowPrivilegedContainer: true
+allowedCapabilities:
+  - SYS_ADMIN
+defaultAddCapabilities: []
+fsGroup:
+  type: RunAsAny
+groups: []
+priority: null
+readOnlyRootFilesystem: false
+requiredDropCapabilities: []
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+users: []
+volumes:
+  - configMap
+  - downwardAPI
+  - emptyDir
+  - hostPath
+  - persistentVolumeClaim
+  - projected
+  - secret
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-gpu-exporter
+  namespace: gpu-monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: my-gpu-exporter-scc-role
+rules:
+  - apiGroups:
+      - security.openshift.io
+    resourceNames:
+      - my-gpu-exporter-scc
+    resources:
+      - securitycontextconstraints
+    verbs:
+      - use
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: my-gpu-exporter-scc-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: my-gpu-exporter-scc-role
+subjects:
+  - kind: ServiceAccount
+    name: my-gpu-exporter
+    namespace: gpu-monitoring

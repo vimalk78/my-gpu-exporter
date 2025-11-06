@@ -1,0 +1,145 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-monitoring
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: my-gpu-exporter
+  namespace: gpu-monitoring
+  labels:
+    app: my-gpu-exporter
+spec:
+  selector:
+    matchLabels:
+      app: my-gpu-exporter
+  template:
+    metadata:
+      labels:
+        app: my-gpu-exporter
+      annotations:
+        openshift.io/scc: my-gpu-exporter-scc
+    spec:
+      hostPID: true
+      hostNetwork: true
+      serviceAccountName: my-gpu-exporter
+      runtimeClassName: nvidia
+
+      containers:
+      - name: exporter
+        image: quay.io/vimalkum/my-gpu-exporter:latest
+        imagePullPolicy: Always
+
+        args:
+        - --log-level=debug
+        - --kubernetes-enabled=true
+        - --pod-resources-socket=/var/lib/kubelet/pod-resources/kubelet.sock
+        - --metric-retention=5m
+        - --process-scan-interval=10s
+
+        ports:
+        - name: metrics
+          containerPort: 9400
+          protocol: TCP
+
+        securityContext:
+          privileged: true
+          runAsUser: 0
+          allowPrivilegeEscalation: true
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9400
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 9400
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility"
+        - name: NVIDIA_DISABLE_REQUIRE
+          value: "true"
+        - name: LD_LIBRARY_PATH
+          value: "/usr/local/nvidia/lib:/usr/local/nvidia/lib64:/usr/local/cuda/lib64"
+
+        volumeMounts:
+        - name: pod-resources
+          mountPath: /var/lib/kubelet/pod-resources
+          readOnly: true
+        - name: proc
+          mountPath: /proc
+          readOnly: true
+        - name: host-proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: run-nvidia
+          mountPath: /run/nvidia
+          mountPropagation: HostToContainer
+          readOnly: true
+
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: PreferNoSchedule
+
+      volumes:
+      - name: pod-resources
+        hostPath:
+          path: /var/lib/kubelet/pod-resources
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: host-proc
+        hostPath:
+          path: /proc
+      - name: run-nvidia
+        hostPath:
+          path: /run/nvidia
+          type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-gpu-exporter
+  namespace: gpu-monitoring
+  labels:
+    app: my-gpu-exporter
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9400"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: 9400
+    targetPort: 9400
+    protocol: TCP
+  selector:
+    app: my-gpu-exporter

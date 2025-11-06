@@ -1,0 +1,142 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: my-gpu-exporter
+  namespace: gpu-monitoring
+  labels:
+    app: my-gpu-exporter
+spec:
+  selector:
+    matchLabels:
+      app: my-gpu-exporter
+  template:
+    metadata:
+      labels:
+        app: my-gpu-exporter
+    spec:
+      # Required for accessing /proc and GPU devices
+      hostPID: true
+      hostNetwork: true
+
+      # Init container to enable GPU accounting mode
+      initContainers:
+      - name: enable-accounting
+        image: nvidia/cuda:12.3.1-base-ubuntu22.04
+        command: ["nvidia-smi", "-am", "1"]
+        securityContext:
+          privileged: true
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "utility"
+
+      containers:
+      - name: exporter
+        image: my-gpu-exporter:latest
+        imagePullPolicy: IfNotPresent
+
+        args:
+        - --log-level=info
+        - --kubernetes-enabled=true
+        - --pod-resources-socket=/var/lib/kubelet/pod-resources/kubelet.sock
+        - --metric-retention=5m
+        - --process-scan-interval=10s
+
+        ports:
+        - name: metrics
+          containerPort: 9400
+          protocol: TCP
+
+        # Required for GPU access and /proc access
+        securityContext:
+          privileged: true
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 9400
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 9400
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility"
+
+        volumeMounts:
+        # Access to kubelet pod-resources API
+        - name: pod-resources
+          mountPath: /var/lib/kubelet/pod-resources
+          readOnly: true
+
+        # Access to /proc for cgroup parsing
+        - name: proc
+          mountPath: /proc
+          readOnly: true
+
+      # Node selector to only run on GPU nodes
+      nodeSelector:
+        nvidia.com/gpu: "true"
+
+      # Tolerate GPU taints
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+
+      volumes:
+      - name: pod-resources
+        hostPath:
+          path: /var/lib/kubelet/pod-resources
+      - name: proc
+        hostPath:
+          path: /proc
+
+      serviceAccountName: my-gpu-exporter
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: my-gpu-exporter
+  namespace: gpu-monitoring
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: my-gpu-exporter
+  namespace: gpu-monitoring
+  labels:
+    app: my-gpu-exporter
+spec:
+  type: ClusterIP
+  ports:
+  - name: metrics
+    port: 9400
+    targetPort: 9400
+    protocol: TCP
+  selector:
+    app: my-gpu-exporter
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gpu-monitoring

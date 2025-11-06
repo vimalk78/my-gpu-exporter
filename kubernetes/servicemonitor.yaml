@@ -1,0 +1,15 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: my-gpu-exporter
+  namespace: gpu-monitoring
+  labels:
+    app: my-gpu-exporter
+spec:
+  selector:
+    matchLabels:
+      app: my-gpu-exporter
+  endpoints:
+  - port: metrics
+    interval: 15s
+    path: /metrics

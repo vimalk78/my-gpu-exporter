@@ -1,0 +1,36 @@
+# Build stage using Red Hat UBI
+FROM registry.access.redhat.com/ubi9/go-toolset:1.21 AS builder
+
+WORKDIR /build
+
+# Copy go mod files
+COPY --chown=1001:0 go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY --chown=1001:0 . .
+
+# Build binary
+RUN CGO_ENABLED=1 GOOS=linux go build -o my-gpu-exporter .
+
+# Runtime stage using NVIDIA CUDA on UBI8
+FROM nvcr.io/nvidia/cuda:12.3.1-base-ubi8
+
+# Install DCGM
+RUN dnf install -y \
+        https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo && \
+    dnf install -y \
+        datacenter-gpu-manager \
+        ca-certificates && \
+    dnf clean all
+
+# Copy binary from builder
+COPY --from=builder /build/my-gpu-exporter /usr/local/bin/my-gpu-exporter
+
+# OpenShift runs with random UID by default, but we need root for GPU access
+# The SecurityContextConstraint will handle this
+USER 0
+
+EXPOSE 9400
+
+ENTRYPOINT ["/usr/local/bin/my-gpu-exporter"]
