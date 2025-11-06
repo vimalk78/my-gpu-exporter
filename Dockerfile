@@ -21,10 +21,6 @@ RUN ln -s /usr/lib64/libdcgm.so.3 /usr/lib64/libdcgm.so.4 && ldconfig
 # Copy binary from builder
 COPY --from=builder /build/my-gpu-exporter /usr/local/bin/my-gpu-exporter
 
-# Copy entrypoint script
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
-
 # Create non-root user
 RUN useradd -r -u 1000 -g root exporter
 
@@ -33,4 +29,5 @@ RUN useradd -r -u 1000 -g root exporter
 
 EXPOSE 9400
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+# Run exporter directly - DCGM embedded mode doesn't need nv-hostengine daemon
+ENTRYPOINT ["/usr/local/bin/my-gpu-exporter"]
