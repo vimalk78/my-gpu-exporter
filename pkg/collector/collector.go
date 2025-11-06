@@ -172,6 +172,16 @@ func (c *Collector) Collect() error {
 			continue
 		}
 
+		// Fallback to NVML memory if DCGM doesn't provide it
+		// DCGM's Memory.GlobalUsed is not supported on all GPU types (e.g., Tesla T4)
+		memoryUsed := metrics.MemoryUsedBytes
+		if memoryUsed == 0 && proc.MemoryUsed > 0 {
+			memoryUsed = proc.MemoryUsed
+			slog.Debug("Using NVML memory fallback (DCGM returned 0)",
+				slog.Uint64("pid", uint64(proc.PID)),
+				slog.Uint64("nvml_memory_bytes", proc.MemoryUsed))
+		}
+
 		// Build process metrics
 		pm := &ProcessMetrics{
 			PID:             proc.PID,
@@ -181,7 +191,7 @@ func (c *Collector) Collect() error {
 			EnergyJoules:    metrics.EnergyConsumed,
 			SmUtilization:   metrics.SmUtilization,
 			MemUtilization:  metrics.MemUtilization,
-			MemoryUsedBytes: metrics.MemoryUsedBytes,
+			MemoryUsedBytes: memoryUsed,
 			StartTime:       metrics.StartTime,
 			EndTime:         metrics.EndTime,
 			ContainerID:     containerID,
