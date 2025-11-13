@@ -11,5 +11,5 @@ spec:
       app: my-gpu-exporter
   endpoints:
   - port: metrics
-    interval: 15s
+    interval: 5s
     path: /metrics
