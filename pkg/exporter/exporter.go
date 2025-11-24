@@ -14,13 +14,17 @@ type Exporter struct {
 	config    *config.Config
 	collector *collector.Collector
 
-	// Metric descriptors
+	// Per-process metric descriptors
 	energyDesc         *prometheus.Desc
 	smUtilDesc         *prometheus.Desc
 	memUtilDesc        *prometheus.Desc
 	memoryUsedDesc     *prometheus.Desc
 	startTimeDesc      *prometheus.Desc
 	activeDesc         *prometheus.Desc
+
+	// GPU-level aggregation metrics (for time-slicing validation)
+	gpuEnergyTotalDesc *prometheus.Desc
+	gpuProcessCountDesc *prometheus.Desc
 }
 
 // NewExporter creates a new Prometheus exporter
@@ -79,6 +83,21 @@ func NewExporter(cfg *config.Config, col *collector.Collector) *Exporter {
 			labels,
 			nil,
 		),
+
+		// GPU-level aggregation metrics
+		gpuEnergyTotalDesc: prometheus.NewDesc(
+			fmt.Sprintf("%s_gpu_energy_joules_total", prefix),
+			"Total energy consumed by all processes on this GPU (sum of per-process energy)",
+			[]string{"gpu"},
+			nil,
+		),
+
+		gpuProcessCountDesc: prometheus.NewDesc(
+			fmt.Sprintf("%s_gpu_process_count", prefix),
+			"Number of active processes on this GPU (indicates time-slicing when > 1)",
+			[]string{"gpu"},
+			nil,
+		),
 	}
 }
 
@@ -90,6 +109,8 @@ func (e *Exporter) Describe(ch chan<- *prometheus.Desc) {
 	ch <- e.memoryUsedDesc
 	ch <- e.startTimeDesc
 	ch <- e.activeDesc
+	ch <- e.gpuEnergyTotalDesc
+	ch <- e.gpuProcessCountDesc
 }
 
 // Collect implements prometheus.Collector
@@ -168,6 +189,42 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 			prometheus.GaugeValue,
 			activeValue,
 			labels...,
+		)
+	}
+
+	// Export GPU-level aggregation metrics (for time-slicing validation)
+	e.exportGPUAggregations(ch, metrics)
+}
+
+// exportGPUAggregations exports aggregated metrics per GPU
+func (e *Exporter) exportGPUAggregations(ch chan<- prometheus.Metric, metrics map[uint]*collector.ProcessMetrics) {
+	// Aggregate energy and count processes per GPU
+	gpuEnergy := make(map[uint]float64)
+	gpuProcessCount := make(map[uint]int)
+
+	for _, pm := range metrics {
+		if pm.IsRunning {
+			gpuEnergy[pm.GPU] += pm.EnergyJoules
+			gpuProcessCount[pm.GPU]++
+		}
+	}
+
+	// Export aggregated metrics
+	for gpuID, totalEnergy := range gpuEnergy {
+		ch <- prometheus.MustNewConstMetric(
+			e.gpuEnergyTotalDesc,
+			prometheus.CounterValue,
+			totalEnergy,
+			fmt.Sprintf("%d", gpuID),
+		)
+	}
+
+	for gpuID, processCount := range gpuProcessCount {
+		ch <- prometheus.MustNewConstMetric(
+			e.gpuProcessCountDesc,
+			prometheus.GaugeValue,
+			float64(processCount),
+			fmt.Sprintf("%d", gpuID),
 		)
 	}
 }

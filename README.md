@@ -114,17 +114,16 @@ sudo ./my-gpu-exporter --log-level=info
 
 ## Metrics
 
-All metrics include these labels:
+### Per-Process Metrics
+
+All per-process metrics include these labels:
 - `pid` - Process ID
 - `gpu` - GPU index
 - `process_name` - Process executable name
 - `pod` - Kubernetes pod name
 - `namespace` - Kubernetes namespace
 - `container` - Container name
-- `pod_uid` - Pod UID
 - `container_id` - Container ID
-
-### Core Metrics
 
 #### Energy (Counter)
 
@@ -165,6 +164,40 @@ GPU memory used by process in bytes.
 ```prometheus
 my_gpu_process_start_time_seconds{...} 1699564800
 my_gpu_process_active{...} 1  # 1=running, 0=exited
+```
+
+### GPU-Level Aggregation Metrics
+
+These metrics aggregate per-process data at the GPU level, useful for validating time-slicing:
+
+#### Total GPU Energy (Counter)
+
+```prometheus
+my_gpu_process_gpu_energy_joules_total{gpu="0"} 45234.5
+```
+
+Sum of energy consumed by all processes on this GPU. With time-slicing, this represents the total GPU energy distributed across multiple processes.
+
+#### GPU Process Count (Gauge)
+
+```prometheus
+my_gpu_process_gpu_process_count{gpu="0"} 3
+```
+
+Number of active processes on this GPU. When `> 1`, indicates time-slicing is active.
+
+**Usage:**
+```promql
+# Detect time-slicing (GPUs with multiple processes)
+my_gpu_process_gpu_process_count > 1
+
+# Total power per GPU (Watts)
+rate(my_gpu_process_gpu_energy_joules_total[1m])
+
+# Verify: GPU total should equal sum of per-process
+rate(my_gpu_process_gpu_energy_joules_total{gpu="0"}[1m])
+==
+sum(rate(my_gpu_process_energy_joules_total{gpu="0"}[1m]))
 ```
 
 ## Example Queries
@@ -215,6 +248,46 @@ sum(my_gpu_process_active)
 sum by (namespace) (my_gpu_process_active)
 ```
 
+## Time-Slicing Support
+
+my-gpu-exporter **fully supports GPU time-slicing** with automatic detection and validation:
+
+### Features
+
+1. **Automatic Detection**: Detects when multiple processes share a GPU
+2. **Per-Process Energy**: Each process gets hardware-measured energy (not estimated)
+3. **Validation**: Warns if energy values look incorrect (all processes showing same value)
+4. **Aggregation Metrics**: GPU-level totals for validation
+
+### Testing Time-Slicing
+
+See [Time-Slicing Testing Guide](docs/TIMESLICING-TEST.md) for comprehensive testing instructions.
+
+Quick validation:
+```bash
+# Deploy test workload (3 pods sharing GPU)
+kubectl apply -f timeslicing-test.yaml
+
+# Check metrics show different energy per process
+curl http://exporter:9400/metrics | grep energy_joules_total
+
+# Verify process count > 1 (indicates time-slicing)
+curl http://exporter:9400/metrics | grep gpu_process_count
+```
+
+### Logs
+
+With time-slicing enabled, exporter logs:
+```
+INFO Time-slicing detected: multiple processes on same GPU gpu=0 process_count=3
+DEBUG Time-slicing validation: energy values properly differentiated gpu=0 process_count=3
+```
+
+If energy values look wrong:
+```
+WARN SUSPICIOUS: All time-sliced processes show identical energy values gpu=0 process_count=3 energy_joules=1234.5 hint="This may indicate GPU accounting mode issues"
+```
+
 ## Comparison with dcgm-exporter
 
 | Feature | dcgm-exporter | my-gpu-exporter |
@@ -222,6 +295,7 @@ sum by (namespace) (my_gpu_process_active)
 | **Scope** | GPU-level | Process-level |
 | **Power metric** | `DCGM_FI_DEV_POWER_USAGE` | `my_gpu_process_energy_joules` |
 | **Time-slicing** | Duplicates same value | Separate measured values |
+| **Time-slice detection** | No | Yes (automatic) |
 | **Estimation** | N/A (whole GPU) | **NO - uses actual measurements** |
 | **Use case** | GPU monitoring | Workload cost attribution |
 
@@ -236,9 +310,15 @@ Sum = 400W (wrong - GPU only uses 200W!)
 
 **my-gpu-exporter** (actual measured values):
 ```prometheus
-my_gpu_process_energy_joules{gpu="0",pod="pod-a"} 120  # Actual: pod-a used 120J
-my_gpu_process_energy_joules{gpu="0",pod="pod-b"} 80   # Actual: pod-b used 80J
-Sum = 200J (correct!)
+# Per-process energy (hardware-measured, different for each)
+my_gpu_process_energy_joules_total{gpu="0",pod="pod-a"} 120
+my_gpu_process_energy_joules_total{gpu="0",pod="pod-b"} 80
+
+# GPU-level aggregation (sum of above)
+my_gpu_process_gpu_energy_joules_total{gpu="0"} 200
+
+# Process count (indicates time-slicing)
+my_gpu_process_gpu_process_count{gpu="0"} 2
 ```
 
 ## Troubleshooting

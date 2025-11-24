@@ -52,6 +52,10 @@ type Collector struct {
 
 	mu              sync.RWMutex
 	processMetrics  map[uint]*ProcessMetrics  // PID -> metrics
+
+	// Time-slicing detection
+	gpuProcessCount map[uint]int              // GPU ID -> number of active processes
+	lastWarningTime time.Time                 // Last time we logged a warning
 }
 
 // NewCollector creates a new collector
@@ -92,12 +96,13 @@ func NewCollector(cfg *config.Config) (*Collector, error) {
 	retention := process.NewRetentionManager(cfg.MetricRetention)
 
 	collector := &Collector{
-		config:         cfg,
-		dcgmClient:     dcgmClient,
-		discovery:      discovery,
-		podMapper:      podMapper,
-		retention:      retention,
-		processMetrics: make(map[uint]*ProcessMetrics),
+		config:          cfg,
+		dcgmClient:      dcgmClient,
+		discovery:       discovery,
+		podMapper:       podMapper,
+		retention:       retention,
+		processMetrics:  make(map[uint]*ProcessMetrics),
+		gpuProcessCount: make(map[uint]int),
 	}
 
 	return collector, nil
@@ -243,7 +248,125 @@ func (c *Collector) Collect() error {
 	// Clean up expired processes from retention manager
 	c.retention.CleanupExpired()
 
+	// Detect and validate time-slicing
+	c.detectAndValidateTimeSlicing()
+
 	return nil
+}
+
+// detectAndValidateTimeSlicing detects GPU time-slicing and validates energy metrics
+func (c *Collector) detectAndValidateTimeSlicing() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Count active processes per GPU and collect their energy values
+	gpuProcesses := make(map[uint][]*ProcessMetrics)
+
+	for _, pm := range c.processMetrics {
+		if pm.IsRunning {
+			gpuProcesses[pm.GPU] = append(gpuProcesses[pm.GPU], pm)
+		}
+	}
+
+	// Check each GPU for time-slicing
+	for gpuID, processes := range gpuProcesses {
+		processCount := len(processes)
+
+		// Update process count tracking
+		c.gpuProcessCount[gpuID] = processCount
+
+		// Single process - no time-slicing
+		if processCount == 1 {
+			continue
+		}
+
+		// Multiple processes detected - time-slicing scenario
+		slog.Info("Time-slicing detected: multiple processes on same GPU",
+			slog.Uint64("gpu", uint64(gpuID)),
+			slog.Int("process_count", processCount))
+
+		// Validate energy attribution
+		c.validateEnergyAttribution(gpuID, processes)
+	}
+}
+
+// validateEnergyAttribution checks if per-process energy values are properly differentiated
+func (c *Collector) validateEnergyAttribution(gpuID uint, processes []*ProcessMetrics) {
+	if len(processes) < 2 {
+		return
+	}
+
+	// Collect energy values (non-zero only)
+	var energyValues []float64
+	var processInfo []string
+
+	for _, pm := range processes {
+		if pm.EnergyJoules > 0 {
+			energyValues = append(energyValues, pm.EnergyJoules)
+			processInfo = append(processInfo, fmt.Sprintf("PID=%d pod=%s energy=%.2fJ",
+				pm.PID, pm.PodName, pm.EnergyJoules))
+		}
+	}
+
+	if len(energyValues) < 2 {
+		// Not enough data to validate
+		return
+	}
+
+	// Log detailed energy breakdown
+	slog.Debug("Time-sliced processes energy breakdown",
+		slog.Uint64("gpu", uint64(gpuID)),
+		slog.Int("process_count", len(processes)),
+		slog.String("processes", fmt.Sprintf("[%s]",
+			fmt.Sprint(processInfo))))
+
+	// Check if all energy values are suspiciously similar
+	allSame := true
+	firstValue := energyValues[0]
+	tolerance := 0.01 // 1% tolerance for floating point comparison
+
+	for _, val := range energyValues[1:] {
+		diff := val - firstValue
+		if diff < 0 {
+			diff = -diff
+		}
+		relativeDiff := diff / firstValue
+
+		if relativeDiff > tolerance {
+			allSame = false
+			break
+		}
+	}
+
+	// Warn if all processes have identical energy (likely a bug)
+	slog.Debug("Validation check",
+		slog.Bool("allSame", allSame),
+		slog.Int("energyValueCount", len(energyValues)),
+		slog.Float64("firstValue", firstValue))
+
+	if allSame {
+		// Rate-limit warnings (once per minute)
+		now := time.Now()
+		timeSinceLastWarn := now.Sub(c.lastWarningTime)
+
+		slog.Debug("All same detected, checking rate limit",
+			slog.Duration("timeSinceLastWarn", timeSinceLastWarn),
+			slog.Bool("shouldWarn", timeSinceLastWarn > time.Minute))
+
+		if timeSinceLastWarn > time.Minute {
+			slog.Warn("SUSPICIOUS: All time-sliced processes show identical energy values",
+				slog.Uint64("gpu", uint64(gpuID)),
+				slog.Int("process_count", len(energyValues)),
+				slog.Float64("energy_joules", firstValue),
+				slog.String("hint", "This may indicate GPU accounting mode issues or DCGM not properly tracking per-process energy"))
+			c.lastWarningTime = now
+		}
+	} else {
+		// Energy values are different - this is expected and correct
+		slog.Debug("Time-slicing validation: energy values properly differentiated",
+			slog.Uint64("gpu", uint64(gpuID)),
+			slog.Int("process_count", len(energyValues)))
+	}
 }
 
 // GetMetrics returns current metrics snapshot
