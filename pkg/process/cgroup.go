@@ -8,6 +8,58 @@ import (
 	"strings"
 )
 
+// GetPodUID extracts the Kubernetes pod UID from a process's cgroup
+// Returns empty string if process is not in a Kubernetes pod
+func GetPodUID(pid uint) (string, error) {
+	cgroupPath := fmt.Sprintf("/proc/%d/cgroup", pid)
+
+	file, err := os.Open(cgroupPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to open cgroup file: %w", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		podUID := extractPodUIDFromCgroupLine(line)
+		if podUID != "" {
+			return podUID, nil
+		}
+	}
+
+	return "", nil
+}
+
+// extractPodUIDFromCgroupLine extracts pod UID from cgroup path
+// Example: kubepods-besteffort-podd916368a_42f4_4dd8_a211_80caf2a7532a.slice
+func extractPodUIDFromCgroupLine(line string) string {
+	// Look for pod UID pattern: kubepods-...-pod<UID>.slice
+	parts := strings.SplitN(line, ":", 3)
+	if len(parts) < 3 {
+		return ""
+	}
+	cgroupPath := parts[2]
+
+	// Find "-pod" followed by UID
+	idx := strings.Index(cgroupPath, "-pod")
+	if idx == -1 {
+		return ""
+	}
+
+	start := idx + len("-pod")
+	// Find the end (.slice)
+	end := strings.Index(cgroupPath[start:], ".slice")
+	if end == -1 {
+		return ""
+	}
+
+	uid := cgroupPath[start : start+end]
+	// Convert underscores back to dashes (cgroup uses _ instead of -)
+	uid = strings.ReplaceAll(uid, "_", "-")
+	return uid
+}
+
 // GetContainerID extracts the container ID from a process's cgroup
 // Returns empty string if process is not containerized
 func GetContainerID(pid uint) (string, error) {

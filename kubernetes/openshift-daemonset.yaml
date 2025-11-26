@@ -37,6 +37,7 @@ spec:
         - --pod-resources-socket=/var/lib/kubelet/pod-resources/kubelet.sock
         - --metric-retention=5m
         - --process-scan-interval=10s
+        - --gpu-idle-power=17  # Measured idle power for T4
 
         ports:
         - name: metrics

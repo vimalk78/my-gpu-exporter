@@ -21,8 +21,9 @@ type ProcessMetrics struct {
 	ProcessName  string
 	IsRunning    bool
 
-	// ACTUAL MEASURED ENERGY (not estimated)
-	EnergyJoules float64
+	// Energy (may be measured or estimated)
+	EnergyJoules    float64
+	EnergyEstimated bool // True if energy is estimated (time-slicing), false if measured
 
 	// Utilization
 	SmUtilization  float64
@@ -55,7 +56,9 @@ type Collector struct {
 
 	// Time-slicing detection
 	gpuProcessCount map[uint]int              // GPU ID -> number of active processes
-	lastWarningTime time.Time                 // Last time we logged a warning
+
+	// Energy estimation timing
+	lastEstimationTime map[uint]time.Time     // GPU ID -> last estimation timestamp
 }
 
 // NewCollector creates a new collector
@@ -96,13 +99,14 @@ func NewCollector(cfg *config.Config) (*Collector, error) {
 	retention := process.NewRetentionManager(cfg.MetricRetention)
 
 	collector := &Collector{
-		config:          cfg,
-		dcgmClient:      dcgmClient,
-		discovery:       discovery,
-		podMapper:       podMapper,
-		retention:       retention,
-		processMetrics:  make(map[uint]*ProcessMetrics),
-		gpuProcessCount: make(map[uint]int),
+		config:             cfg,
+		dcgmClient:         dcgmClient,
+		discovery:          discovery,
+		podMapper:          podMapper,
+		retention:          retention,
+		processMetrics:     make(map[uint]*ProcessMetrics),
+		gpuProcessCount:    make(map[uint]int),
+		lastEstimationTime: make(map[uint]time.Time),
 	}
 
 	return collector, nil
@@ -149,14 +153,21 @@ func (c *Collector) Collect() error {
 		if c.podMapper != nil {
 			podInfo, err = c.podMapper.GetPodInfo(containerID)
 			if err != nil {
-				slog.Warn("Failed to get pod info",
+				slog.Debug("Failed to get pod info by container ID",
 					slog.Uint64("pid", uint64(proc.PID)),
 					slog.String("container_id", containerID),
 					slog.String("error", err.Error()))
 			}
 
+			// Fallback: try lookup by pod UID from cgroup
 			if podInfo == nil {
-				// Pod info not available - export metrics with empty pod labels
+				podUID, _ := process.GetPodUID(proc.PID)
+				if podUID != "" {
+					podInfo, _ = c.podMapper.GetPodInfoByUID(podUID)
+				}
+			}
+
+			if podInfo == nil {
 				slog.Debug("Pod info not available, exporting with empty pod labels",
 					slog.Uint64("pid", uint64(proc.PID)),
 					slog.String("container_id", containerID))
@@ -209,8 +220,13 @@ func (c *Collector) Collect() error {
 			pm.ContainerName = podInfo.ContainerName
 		}
 
-		// Store metrics
+		// Store metrics - preserve accumulated energy if estimation was active
 		c.mu.Lock()
+		if existingPM, exists := c.processMetrics[proc.PID]; exists && existingPM.EnergyEstimated {
+			// Preserve accumulated energy from estimation
+			pm.EnergyJoules = existingPM.EnergyJoules
+			pm.EnergyEstimated = true
+		}
 		c.processMetrics[proc.PID] = pm
 		c.mu.Unlock()
 
@@ -254,12 +270,12 @@ func (c *Collector) Collect() error {
 	return nil
 }
 
-// detectAndValidateTimeSlicing detects GPU time-slicing and validates energy metrics
+// detectAndValidateTimeSlicing detects GPU time-slicing and applies estimation if needed
 func (c *Collector) detectAndValidateTimeSlicing() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Count active processes per GPU and collect their energy values
+	// Count active processes per GPU
 	gpuProcesses := make(map[uint][]*ProcessMetrics)
 
 	for _, pm := range c.processMetrics {
@@ -275,98 +291,106 @@ func (c *Collector) detectAndValidateTimeSlicing() {
 		// Update process count tracking
 		c.gpuProcessCount[gpuID] = processCount
 
-		// Single process - no time-slicing
+		// Single process - no time-slicing, use DCGM values directly
 		if processCount == 1 {
+			slog.Debug("Single process on GPU, using DCGM measured energy",
+				slog.Uint64("gpu", uint64(gpuID)))
 			continue
 		}
 
 		// Multiple processes detected - time-slicing scenario
-		slog.Info("Time-slicing detected: multiple processes on same GPU",
+		// Always use estimation for time-slicing
+		slog.Info("Time-slicing detected: using SM-based energy estimation",
 			slog.Uint64("gpu", uint64(gpuID)),
 			slog.Int("process_count", processCount))
 
-		// Validate energy attribution
-		c.validateEnergyAttribution(gpuID, processes)
+		if c.config.EnableEnergyEstimation {
+			err := c.applyEnergyEstimation(gpuID, processes)
+			if err != nil {
+				slog.Warn("Failed to apply energy estimation",
+					slog.Uint64("gpu", uint64(gpuID)),
+					slog.String("error", err.Error()))
+			}
+		} else {
+			slog.Warn("Time-slicing detected but estimation is disabled",
+				slog.Uint64("gpu", uint64(gpuID)),
+				slog.Int("process_count", processCount),
+				slog.String("hint", "Enable --enable-energy-estimation for accurate per-process attribution"))
+		}
 	}
 }
 
-// validateEnergyAttribution checks if per-process energy values are properly differentiated
-func (c *Collector) validateEnergyAttribution(gpuID uint, processes []*ProcessMetrics) {
-	if len(processes) < 2 {
-		return
-	}
-
-	// Collect energy values (non-zero only)
-	var energyValues []float64
-	var processInfo []string
-
+// applyEnergyEstimation estimates per-process energy based on SM utilization
+func (c *Collector) applyEnergyEstimation(gpuID uint, processes []*ProcessMetrics) error {
+	// Calculate total SM utilization across all processes
+	var totalSMUtil float64
 	for _, pm := range processes {
-		if pm.EnergyJoules > 0 {
-			energyValues = append(energyValues, pm.EnergyJoules)
-			processInfo = append(processInfo, fmt.Sprintf("PID=%d pod=%s energy=%.2fJ",
-				pm.PID, pm.PodName, pm.EnergyJoules))
-		}
+		totalSMUtil += pm.SmUtilization
 	}
 
-	if len(energyValues) < 2 {
-		// Not enough data to validate
-		return
+	if totalSMUtil == 0 {
+		slog.Debug("No SM utilization detected, cannot estimate energy",
+			slog.Uint64("gpu", uint64(gpuID)))
+		return nil
 	}
 
-	// Log detailed energy breakdown
-	slog.Debug("Time-sliced processes energy breakdown",
-		slog.Uint64("gpu", uint64(gpuID)),
-		slog.Int("process_count", len(processes)),
-		slog.String("processes", fmt.Sprintf("[%s]",
-			fmt.Sprint(processInfo))))
-
-	// Check if all energy values are suspiciously similar
-	allSame := true
-	firstValue := energyValues[0]
-	tolerance := 0.01 // 1% tolerance for floating point comparison
-
-	for _, val := range energyValues[1:] {
-		diff := val - firstValue
-		if diff < 0 {
-			diff = -diff
-		}
-		relativeDiff := diff / firstValue
-
-		if relativeDiff > tolerance {
-			allSame = false
-			break
-		}
+	// Get GPU-level power usage
+	gpuPower, err := c.dcgmClient.GetGPUPowerUsage(gpuID)
+	if err != nil {
+		return fmt.Errorf("failed to get GPU power: %w", err)
 	}
 
-	// Warn if all processes have identical energy (likely a bug)
-	slog.Debug("Validation check",
-		slog.Bool("allSame", allSame),
-		slog.Int("energyValueCount", len(energyValues)),
-		slog.Float64("firstValue", firstValue))
-
-	if allSame {
-		// Rate-limit warnings (once per minute)
-		now := time.Now()
-		timeSinceLastWarn := now.Sub(c.lastWarningTime)
-
-		slog.Debug("All same detected, checking rate limit",
-			slog.Duration("timeSinceLastWarn", timeSinceLastWarn),
-			slog.Bool("shouldWarn", timeSinceLastWarn > time.Minute))
-
-		if timeSinceLastWarn > time.Minute {
-			slog.Warn("SUSPICIOUS: All time-sliced processes show identical energy values",
-				slog.Uint64("gpu", uint64(gpuID)),
-				slog.Int("process_count", len(energyValues)),
-				slog.Float64("energy_joules", firstValue),
-				slog.String("hint", "This may indicate GPU accounting mode issues or DCGM not properly tracking per-process energy"))
-			c.lastWarningTime = now
-		}
+	// Calculate actual elapsed time since last estimation
+	now := time.Now()
+	var intervalSeconds float64
+	if lastTime, exists := c.lastEstimationTime[gpuID]; exists {
+		intervalSeconds = now.Sub(lastTime).Seconds()
 	} else {
-		// Energy values are different - this is expected and correct
-		slog.Debug("Time-slicing validation: energy values properly differentiated",
-			slog.Uint64("gpu", uint64(gpuID)),
-			slog.Int("process_count", len(energyValues)))
+		// First estimation - use configured interval as fallback
+		intervalSeconds = c.config.DCGMUpdateFrequency.Seconds()
 	}
+	c.lastEstimationTime[gpuID] = now
+
+	// Subtract idle power to get active power only
+	activePower := gpuPower - c.config.GPUIdlePower
+	if activePower < 0 {
+		activePower = 0 // Can't be negative
+	}
+
+	slog.Debug("GPU power for estimation",
+		slog.Uint64("gpu", uint64(gpuID)),
+		slog.Float64("total_power_watts", gpuPower),
+		slog.Float64("idle_power_watts", c.config.GPUIdlePower),
+		slog.Float64("active_power_watts", activePower),
+		slog.Float64("total_sm_util", totalSMUtil),
+		slog.Float64("interval_seconds", intervalSeconds))
+
+	// Calculate total GPU energy for this interval (using active power only)
+	gpuEnergyJoules := activePower * intervalSeconds
+
+	// Distribute energy proportionally based on SM utilization
+	for _, pm := range processes {
+		// Proportional attribution: process_energy = gpu_energy * (process_sm_util / total_sm_util)
+		proportion := pm.SmUtilization / totalSMUtil
+		estimatedEnergyInterval := gpuEnergyJoules * proportion
+
+		// Accumulate the energy (counter behavior)
+		// Note: This adds the estimated energy for this interval to the cumulative total
+		previousEnergy := pm.EnergyJoules
+		pm.EnergyJoules += estimatedEnergyInterval
+		pm.EnergyEstimated = true
+
+		slog.Debug("Applied energy estimation",
+			slog.Uint64("pid", uint64(pm.PID)),
+			slog.String("pod", pm.PodName),
+			slog.Float64("sm_util", pm.SmUtilization),
+			slog.Float64("proportion", proportion),
+			slog.Float64("interval_energy_J", estimatedEnergyInterval),
+			slog.Float64("previous_total_J", previousEnergy),
+			slog.Float64("new_total_J", pm.EnergyJoules))
+	}
+
+	return nil
 }
 
 // GetMetrics returns current metrics snapshot

@@ -32,17 +32,21 @@ func NewExporter(cfg *config.Config, col *collector.Collector) *Exporter {
 	prefix := cfg.MetricPrefix
 
 	// Common labels for all metrics
-	labels := []string{"pid", "gpu", "process_name", "pod", "namespace", "container", "container_id"}
+	// Use exported_ prefix for pod/namespace/container to match DCGM convention
+	labels := []string{"pid", "gpu", "process_name", "exported_pod", "exported_namespace", "exported_container", "container_id"}
+
+	// Energy metric has additional label to indicate if estimated
+	energyLabels := append(labels, "energy_estimated")
 
 	return &Exporter{
 		config:    cfg,
 		collector: col,
 
-		// Energy metric - ACTUAL MEASURED VALUE (not estimated)
+		// Energy metric - may be measured or estimated (indicated by label)
 		energyDesc: prometheus.NewDesc(
 			fmt.Sprintf("%s_energy_joules_total", prefix),
-			"ACTUAL hardware-measured cumulative energy consumed by process in Joules (NOT estimated)",
-			labels,
+			"Cumulative energy consumed by process in Joules (energy_estimated=true if SM-based estimation used)",
+			energyLabels,
 			nil,
 		),
 
@@ -139,12 +143,18 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 		}
 
 		// Energy - COUNTER (cumulative)
-		// This is ACTUAL measured energy from GPU hardware, NOT estimated
+		// Include energy_estimated label to indicate if value is estimated or measured
+		estimatedLabel := "false"
+		if pm.EnergyEstimated {
+			estimatedLabel = "true"
+		}
+		energyLabels := append(labels, estimatedLabel)
+
 		ch <- prometheus.MustNewConstMetric(
 			e.energyDesc,
 			prometheus.CounterValue,
 			pm.EnergyJoules,
-			labels...,
+			energyLabels...,
 		)
 
 		// SM Utilization - GAUGE

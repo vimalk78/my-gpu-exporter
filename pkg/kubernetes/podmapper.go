@@ -2,9 +2,13 @@ package kubernetes
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
-	"net"
+	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -29,9 +33,12 @@ type PodInfo struct {
 
 // PodMapper maps container IDs to Kubernetes pod information
 type PodMapper struct {
-	socketPath string
-	cache      map[string]*PodInfo
-	lastUpdate time.Time
+	socketPath   string
+	cache        map[string]*PodInfo // keyed by container_id or pod_uid
+	uidCache     map[string]*PodInfo // keyed by pod_uid
+	lastUpdate   time.Time
+	k8sAPIClient *http.Client
+	k8sToken     string
 }
 
 // NewPodMapper creates a new pod mapper
@@ -40,10 +47,28 @@ func NewPodMapper(socketPath string) *PodMapper {
 		socketPath = defaultSocketPath
 	}
 
-	return &PodMapper{
+	pm := &PodMapper{
 		socketPath: socketPath,
 		cache:      make(map[string]*PodInfo),
+		uidCache:   make(map[string]*PodInfo),
 	}
+
+	// Set up K8s API client for in-cluster access
+	token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+	if err == nil {
+		pm.k8sToken = string(token)
+		pm.k8sAPIClient = &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		}
+		slog.Debug("Kubernetes API client initialized")
+	} else {
+		slog.Debug("No service account token found, pod UID lookup disabled")
+	}
+
+	return pm
 }
 
 // GetPodInfo returns pod information for a given container ID
@@ -56,13 +81,128 @@ func (pm *PodMapper) GetPodInfo(containerID string) (*PodInfo, error) {
 		}
 	}
 
-	// Lookup in cache
+	// Lookup in cache by container ID
 	if info, ok := pm.cache[containerID]; ok {
 		return info, nil
 	}
 
 	// Not found - not a Kubernetes pod
 	return nil, nil
+}
+
+// GetPodInfoByUID returns pod information for a given pod UID
+func (pm *PodMapper) GetPodInfoByUID(podUID string) (*PodInfo, error) {
+	// Check UID cache first
+	if info, ok := pm.uidCache[podUID]; ok {
+		return info, nil
+	}
+
+	// Query Kubernetes API for pod info
+	if pm.k8sAPIClient != nil && podUID != "" {
+		info, err := pm.queryPodByUID(podUID)
+		if err != nil {
+			slog.Debug("Failed to query pod by UID", slog.String("uid", podUID), slog.String("error", err.Error()))
+		} else if info != nil {
+			pm.uidCache[podUID] = info
+			return info, nil
+		}
+	}
+
+	return nil, nil
+}
+
+// queryPodByUID queries Kubernetes API to get pod info by UID
+func (pm *PodMapper) queryPodByUID(podUID string) (*PodInfo, error) {
+	if pm.k8sAPIClient == nil {
+		return nil, nil
+	}
+
+	// Check cache first
+	if info, ok := pm.uidCache[podUID]; ok {
+		return info, nil
+	}
+
+	// Not in cache - refresh and try again (new pod may have been created)
+	if err := pm.refreshUIDCache(); err != nil {
+		return nil, err
+	}
+
+	if info, ok := pm.uidCache[podUID]; ok {
+		return info, nil
+	}
+
+	return nil, nil
+}
+
+// refreshUIDCache fetches all pods from K8s API and builds UID -> PodInfo cache
+func (pm *PodMapper) refreshUIDCache() error {
+	if pm.k8sAPIClient == nil {
+		return nil
+	}
+
+	// Get API server address from environment (works with hostNetwork)
+	apiHost := os.Getenv("KUBERNETES_SERVICE_HOST")
+	apiPort := os.Getenv("KUBERNETES_SERVICE_PORT")
+	if apiHost == "" {
+		apiHost = "kubernetes.default.svc"
+	}
+	if apiPort == "" {
+		apiPort = "443"
+	}
+
+	url := fmt.Sprintf("https://%s:%s/api/v1/pods", apiHost, apiPort)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+pm.k8sToken)
+
+	resp, err := pm.k8sAPIClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("K8s API returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Items []struct {
+			Metadata struct {
+				Name      string `json:"name"`
+				Namespace string `json:"namespace"`
+				UID       string `json:"uid"`
+			} `json:"metadata"`
+			Spec struct {
+				Containers []struct {
+					Name string `json:"name"`
+				} `json:"containers"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return err
+	}
+
+	// Build UID cache
+	for _, pod := range result.Items {
+		containerName := ""
+		if len(pod.Spec.Containers) > 0 {
+			containerName = pod.Spec.Containers[0].Name // Use first container
+		}
+		pm.uidCache[pod.Metadata.UID] = &PodInfo{
+			PodName:       pod.Metadata.Name,
+			PodNamespace:  pod.Metadata.Namespace,
+			ContainerName: containerName,
+		}
+	}
+
+	slog.Debug("Refreshed pod UID cache", slog.Int("pods", len(result.Items)))
+	return nil
 }
 
 // refreshCache updates the pod information cache
@@ -177,13 +317,11 @@ func (pm *PodMapper) GetPodInfoByPodContainer(namespace, podName, containerName 
 
 // connectToKubelet establishes gRPC connection to kubelet
 func connectToKubelet(socketPath string) (*grpc.ClientConn, func(), error) {
+	// Use unix:// scheme for gRPC to properly resolve the socket path
+	target := "unix://" + socketPath
 	conn, err := grpc.NewClient(
-		socketPath,
+		target,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-			d := net.Dialer{}
-			return d.DialContext(ctx, "unix", addr)
-		}),
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to connect to kubelet socket: %w", err)

@@ -33,7 +33,7 @@ spec:
 
       containers:
       - name: exporter
-        image: my-gpu-exporter:latest
+        image: quay.io/vimalkum/my-gpu-exporter:latest
         imagePullPolicy: IfNotPresent
 
         args:
@@ -95,7 +95,7 @@ spec:
 
       # Node selector to only run on GPU nodes
       nodeSelector:
-        nvidia.com/gpu: "true"
+        nvidia.com/gpu.present: "true"
 
       # Tolerate GPU taints
       tolerations:

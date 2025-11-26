@@ -4,28 +4,38 @@ A Prometheus exporter that exposes **per-process GPU energy consumption** for Ku
 
 ## Key Features
 
-- ✅ **ACTUAL Hardware-Measured Energy** - NOT estimates or approximations
+- ✅ **Hardware-Measured Energy** - Direct from GPU hardware (when available)
+- ✅ **SM-Based Estimation** - Automatic fallback when time-slicing detected
 - ✅ **Per-Process Attribution** - Accurate workload-level power consumption
 - ✅ **Kubernetes Integration** - Automatic pod/namespace/container labeling
-- ✅ **GPU Time-Slicing Support** - Each pod gets its own measured energy
+- ✅ **GPU Time-Slicing Support** - Each pod gets its own measured/estimated energy
 - ✅ **Process Lifecycle Management** - Retains metrics after process exits
 - ✅ **Prometheus Native** - Standard metrics and labels
 
-## Critical: This Does NOT Estimate
+## Energy Measurement: Hardware vs Estimation
 
-**IMPORTANT:** This exporter uses DCGM's per-process energy API (`dcgm.GetProcessInfo().EnergyConsumed`) which provides **actual hardware-measured energy consumption**.
+This exporter prioritizes **hardware-measured energy** from DCGM but automatically falls back to **SM-based estimation** when needed.
 
-This is **NOT**:
-- ❌ Estimated based on GPU utilization ratios
-- ❌ Calculated by splitting GPU-level power
-- ❌ Approximated using any formula
-- ❌ Derived from proportional attribution
+### Hardware-Measured Energy (Default)
 
-This **IS**:
+**When single process per GPU:**
+- ✅ Uses DCGM's per-process energy API (`dcgm.GetProcessInfo().EnergyConsumed`)
 - ✅ Hardware telemetry from the GPU
 - ✅ Actual energy consumed by each process
-- ✅ Measured by DCGM's accounting system
-- ✅ Accurate per-process attribution
+- ✅ Most accurate attribution
+- ✅ Label: `energy_estimated="false"`
+
+### SM-Based Estimation (Fallback)
+
+**When time-slicing detected with DCGM bug (identical energy values):**
+- ✅ Automatically detects the issue
+- ✅ Estimates energy using SM utilization ratios
+- ✅ Formula: `process_energy = gpu_power × (process_sm_util / total_sm_util)`
+- ✅ Logs estimation mode for transparency
+- ✅ Label: `energy_estimated="true"`
+- ℹ️ Enable/disable with `--enable-energy-estimation` (enabled by default)
+
+**Why estimation is needed:** DCGM has a bug where all time-sliced processes report identical energy values (the GPU total). See [DCGM Time-Slicing Energy Bug](docs/DCGM-TIME-SLICING-ENERGY-BUG.md) for details.
 
 ## Requirements
 
@@ -107,6 +117,7 @@ sudo ./my-gpu-exporter --log-level=info
 --pod-resources-socket=/var/lib/kubelet/pod-resources/kubelet.sock
 --metric-retention=5m               # Retain exited process metrics
 --metric-prefix=my_gpu_process      # Prometheus metric name prefix
+--enable-energy-estimation=true     # Enable SM-based estimation for time-slicing
 --listen-address=:9400              # HTTP server address
 --metrics-path=/metrics             # Metrics endpoint path
 --log-level=info                    # Log level (debug, info, warn, error)
@@ -128,10 +139,25 @@ All per-process metrics include these labels:
 #### Energy (Counter)
 
 ```prometheus
-my_gpu_process_energy_joules{pid="12345",gpu="0",pod="training-job",...} 15234.5
+# Hardware-measured (single process)
+my_gpu_process_energy_joules_total{...,energy_estimated="false"} 15234.5
+
+# SM-based estimation (time-slicing with DCGM bug)
+my_gpu_process_energy_joules_total{...,energy_estimated="true"} 8421.2
 ```
 
-**IMPORTANT:** This is **ACTUAL measured energy** from GPU hardware, NOT estimated!
+**Energy Source:**
+- `energy_estimated="false"` - Hardware-measured from GPU (most accurate)
+- `energy_estimated="true"` - SM-based estimation (automatic fallback for time-slicing)
+
+**Query to filter by energy source:**
+```promql
+# Only hardware-measured energy
+my_gpu_process_energy_joules_total{energy_estimated="false"}
+
+# Only estimated energy
+my_gpu_process_energy_joules_total{energy_estimated="true"}
+```
 
 **Usage:**
 ```promql
@@ -250,14 +276,17 @@ sum by (namespace) (my_gpu_process_active)
 
 ## Time-Slicing Support
 
-my-gpu-exporter **fully supports GPU time-slicing** with automatic detection and validation:
+my-gpu-exporter **fully supports GPU time-slicing** with automatic detection and intelligent energy attribution:
 
 ### Features
 
 1. **Automatic Detection**: Detects when multiple processes share a GPU
-2. **Per-Process Energy**: Each process gets hardware-measured energy (not estimated)
-3. **Validation**: Warns if energy values look incorrect (all processes showing same value)
-4. **Aggregation Metrics**: GPU-level totals for validation
+2. **Smart Energy Attribution**:
+   - **Hardware-measured** (preferred): Uses DCGM when values are differentiated
+   - **SM-based estimation** (fallback): Automatically applied when DCGM reports identical values (bug)
+3. **Transparent Labeling**: `energy_estimated` label indicates measurement method
+4. **Validation**: Detects and logs DCGM time-slicing bug
+5. **Aggregation Metrics**: GPU-level totals for validation
 
 ### Testing Time-Slicing
 
@@ -277,15 +306,22 @@ curl http://exporter:9400/metrics | grep gpu_process_count
 
 ### Logs
 
-With time-slicing enabled, exporter logs:
+**When time-slicing detected with proper DCGM values:**
 ```
 INFO Time-slicing detected: multiple processes on same GPU gpu=0 process_count=3
 DEBUG Time-slicing validation: energy values properly differentiated gpu=0 process_count=3
 ```
 
-If energy values look wrong:
+**When DCGM bug detected (identical values) and estimation is applied:**
 ```
-WARN SUSPICIOUS: All time-sliced processes show identical energy values gpu=0 process_count=3 energy_joules=1234.5 hint="This may indicate GPU accounting mode issues"
+INFO Time-slicing detected: multiple processes on same GPU gpu=0 process_count=3
+INFO Applying SM-based energy estimation for time-sliced processes gpu=0 process_count=3
+DEBUG Applied energy estimation pid=12345 pod=training-job sm_util=0.39 proportion=0.78 estimated_energy_J=245.3
+```
+
+**If estimation is disabled:**
+```
+WARN SUSPICIOUS: All time-sliced processes show identical energy values (estimation disabled) hint="Enable --enable-energy-estimation to use SM-based estimation"
 ```
 
 ## Comparison with dcgm-exporter
@@ -294,9 +330,11 @@ WARN SUSPICIOUS: All time-sliced processes show identical energy values gpu=0 pr
 |---------|---------------|-----------------|
 | **Scope** | GPU-level | Process-level |
 | **Power metric** | `DCGM_FI_DEV_POWER_USAGE` | `my_gpu_process_energy_joules` |
-| **Time-slicing** | Duplicates same value | Separate measured values |
+| **Time-slicing** | Duplicates same value | Smart attribution (measured or estimated) |
 | **Time-slice detection** | No | Yes (automatic) |
-| **Estimation** | N/A (whole GPU) | **NO - uses actual measurements** |
+| **DCGM bug detection** | No | Yes (with auto-fallback) |
+| **Energy attribution** | N/A (whole GPU) | Hardware-measured (preferred), SM-estimated (fallback) |
+| **Transparency** | N/A | `energy_estimated` label shows method |
 | **Use case** | GPU monitoring | Workload cost attribution |
 
 ### Example with Time-Slicing
@@ -308,13 +346,18 @@ DCGM_FI_DEV_POWER_USAGE{gpu="0",exported_pod="pod-b"} 200
 Sum = 400W (wrong - GPU only uses 200W!)
 ```
 
-**my-gpu-exporter** (actual measured values):
+**my-gpu-exporter** (intelligent attribution):
 ```prometheus
-# Per-process energy (hardware-measured, different for each)
-my_gpu_process_energy_joules_total{gpu="0",pod="pod-a"} 120
-my_gpu_process_energy_joules_total{gpu="0",pod="pod-b"} 80
+# Scenario 1: DCGM provides correct per-process values (hardware-measured)
+my_gpu_process_energy_joules_total{gpu="0",pod="pod-a",energy_estimated="false"} 120
+my_gpu_process_energy_joules_total{gpu="0",pod="pod-b",energy_estimated="false"} 80
 
-# GPU-level aggregation (sum of above)
+# Scenario 2: DCGM bug detected, SM-based estimation applied
+# (pod-a has 60% SM util, pod-b has 40% SM util, GPU power is 200W)
+my_gpu_process_energy_joules_total{gpu="0",pod="pod-a",energy_estimated="true"} 120
+my_gpu_process_energy_joules_total{gpu="0",pod="pod-b",energy_estimated="true"} 80
+
+# GPU-level aggregation (always correct)
 my_gpu_process_gpu_energy_joules_total{gpu="0"} 200
 
 # Process count (indicates time-slicing)

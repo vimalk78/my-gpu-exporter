@@ -151,6 +151,29 @@ func (c *Client) GetProcessMetrics(pid uint) (*ProcessMetrics, error) {
 	return metrics, nil
 }
 
+// GetGPUPowerUsage retrieves current power usage for a GPU in watts
+func (c *Client) GetGPUPowerUsage(gpuID uint) (float64, error) {
+	if !c.initialized {
+		return 0, fmt.Errorf("DCGM client not initialized")
+	}
+
+	// Use GetLatestValuesForFields to get power usage
+	// This is simpler and doesn't require creating/destroying groups
+	fields := []dcgm.Short{dcgm.DCGM_FI_DEV_POWER_USAGE}
+	values, err := dcgm.GetLatestValuesForFields(gpuID, fields)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get power usage for GPU %d: %w", gpuID, err)
+	}
+
+	if len(values) == 0 {
+		return 0, fmt.Errorf("no power data available for GPU %d", gpuID)
+	}
+
+	// Power is in watts
+	power := values[0].Float64()
+	return power, nil
+}
+
 // Shutdown cleans up DCGM resources
 func (c *Client) Shutdown() error {
 	if !c.initialized {
